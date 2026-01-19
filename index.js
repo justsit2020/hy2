@@ -10,7 +10,7 @@ const { spawn, spawnSync } = require('child_process');
 
 process.umask(0o077);
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 14421; // 只需要改这里：也可用环境变量 PORT 覆盖
+const PORT = process.env.PORT ? Number(process.env.PORT) : 7681; // 只需要改这里：也可用环境变量 PORT 覆盖
 const SNI_HOST = 'www.bing.com'; // 固定 SNI
 
 const BASE_DIR = '/home/container/.hy2';
@@ -453,3 +453,4 @@ Notes:
 })().catch(async (e) => {
   await fatal(e?.stack || String(e));
 });
+
