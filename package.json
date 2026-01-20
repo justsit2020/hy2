@@ -4,5 +4,9 @@
   "main": "index.js",
   "type": "commonjs",
   "private": true,
-  "dependencies": {}
+  "dependencies": {},
+  "scripts": {
+    "start": "node index.js"
+  }
 }
+
