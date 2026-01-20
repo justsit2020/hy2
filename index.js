@@ -9,7 +9,9 @@ const AdmZip = require('adm-zip');
 
 // --- 基础配置 ---
 const PORT = process.env.PORT || 3000;
-const UUID = (process.env.UUID || '16927f80-993d-4c3d-8228-569031a0d844').trim();
+// 自动去除 UUID 空格
+const UUID = (process.env.UUID || uuidv4()).trim();
+// 自动处理路径
 let NESTED_PATH = (process.env.VMESS_PATH || '/vless').trim();
 if (!NESTED_PATH.startsWith('/')) NESTED_PATH = '/' + NESTED_PATH;
 
@@ -17,10 +19,9 @@ const TMP_DIR = '/tmp';
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
 const INTERNAL_PORT = 10000;
 
-// 既然已经验证是 ARM64，直接锁定下载地址，不再试错
 const URL_ARM = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-arm64-v8a.zip';
 
-console.log(`[Init] 正在启动... 架构锁定: ARM64`);
+console.log(`[Init] 启动准备... 架构: ARM64`);
 console.log(`[Init] UUID: ${UUID}`);
 
 // --- 下载工具 ---
@@ -46,18 +47,13 @@ async function installCore() {
   
   if (fs.existsSync(binPath)) {
     try {
-      // 验证现有文件是否完好
       execSync(`${binPath} -version`);
-      console.log(`[Init] 现有核心校验通过`);
+      console.log(`[Init] 核心校验通过`);
       return true;
-    } catch(e) { 
-      console.log(`[Init] 现有核心损坏，重新下载...`);
-      fs.unlinkSync(binPath); 
-    }
+    } catch(e) { fs.unlinkSync(binPath); }
   }
 
   try {
-    console.log(`[Download] 下载 Xray (ARM64)...`);
     await downloadFile(URL_ARM, zipPath);
     const zip = new AdmZip(zipPath);
     zip.extractAllTo(TMP_DIR, true);
@@ -67,16 +63,16 @@ async function installCore() {
     console.log(`[Success] 安装成功`);
     return true;
   } catch (e) {
-    console.error(`[Fatal] 安装失败: ${e.message}`);
+    console.error(`[Fatal] 安装失败`);
     return false;
   }
 }
 
-// --- 主程序 ---
+// --- 主逻辑 ---
 async function start() {
   if (!await installCore()) process.exit(1);
 
-  // --- 配置文件 (VLESS + VLESS) ---
+  // --- VLESS 配置 ---
   const config = {
     "log": { "loglevel": "warning" },
     "inbounds": [{
@@ -84,8 +80,8 @@ async function start() {
       "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": { 
-        "clients": [{ "id": UUID }], 
-        "decryption": "none" 
+        "clients": [{ "id": UUID }],
+        "decryption": "none"
       },
       "streamSettings": { 
         "network": "ws", 
@@ -104,17 +100,13 @@ async function start() {
   const server = http.createServer((req, res) => {
     if (req.url === '/') {
       const host = req.headers.host;
-      const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-ARM64`;
+      const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-Fixed`;
       
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
-        <div style="padding: 20px; font-family: sans-serif;">
-          <h2 style="color:green">✅ 系统正常 (ARM64/VLESS)</h2>
-          <p><strong>UUID:</strong> ${UUID}</p>
-          <hr>
-          <h3>🔗 VLESS 链接:</h3>
-          <textarea style="width:100%; height:100px;">${vlessLink}</textarea>
-        </div>
+        <h2>✅ 服务运行中 (透传模式)</h2>
+        <p>UUID: ${UUID}</p>
+        <textarea style="width:100%; height:100px;">${vlessLink}</textarea>
       `);
     } else {
       res.writeHead(404);
@@ -122,41 +114,41 @@ async function start() {
     }
   });
 
-  // --- 终极无损管道转发 ---
+  // --- 终极透传管道 ---
   server.on('upgrade', (req, socket, head) => {
     if (req.url.startsWith(NESTED_PATH)) {
-      // 1. 暂停客户端 socket，防止数据在连接后端前流失
-      socket.pause();
-
+      
       const proxySocket = net.connect(INTERNAL_PORT, '127.0.0.1', () => {
-        // 2. 只有连接成功后，才写入握手头
-        proxySocket.write(`GET ${NESTED_PATH} HTTP/1.1\r\n` +
-                          `Host: ${req.headers.host}\r\n` +
-                          `Upgrade: websocket\r\n` +
-                          `Connection: Upgrade\r\n` +
-                          `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}\r\n` +
-                          `Sec-WebSocket-Version: ${req.headers['sec-websocket-version']}\r\n` +
-                          `\r\n`);
+        // 1. 构造请求行
+        let headers = `GET ${NESTED_PATH} HTTP/1.1\r\n`;
         
-        // 3. 写入头部携带的数据 (如果有)
+        // 2. 智能透传 Header
+        // 遍历所有 Header，除了 Host (我们自己重写) 和 压缩相关的 (防止兼容问题)
+        for (let key in req.headers) {
+          if (key.toLowerCase() !== 'host' && key.toLowerCase() !== 'sec-websocket-extensions') {
+            headers += `${key}: ${req.headers[key]}\r\n`;
+          }
+        }
+        
+        // 3. 补全必要 Header
+        headers += `Host: ${req.headers.host}\r\n`;
+        headers += `\r\n`; // 结束头
+
+        // 4. 发送握手
+        proxySocket.write(headers);
+        
+        // 5. 发送 Body (如有)
         if (head && head.length > 0) proxySocket.write(head);
         
-        // 4. 对接管道
+        // 6. 建立管道
         socket.pipe(proxySocket);
         proxySocket.pipe(socket);
         
-        // 5. 恢复数据流
-        socket.resume();
-        console.log(`[Proxy] 隧道建立: ${req.headers['x-forwarded-for'] || 'Direct'}`);
+        console.log(`[Proxy] 隧道建立成功`);
       });
 
-      proxySocket.on('error', (e) => {
-        console.error(`[ProxyErr] 后端断开: ${e.message}`);
-        socket.destroy();
-      });
-      socket.on('error', (e) => {
-        proxySocket.destroy();
-      });
+      proxySocket.on('error', () => socket.destroy());
+      socket.on('error', () => proxySocket.destroy());
 
     } else {
       socket.destroy();
@@ -164,7 +156,7 @@ async function start() {
   });
 
   server.listen(PORT, () => {
-    console.log(`[Server] 服务运行在: ${PORT}`);
+    console.log(`[Server] 服务启动: 端口 ${PORT}`);
   });
 }
 
