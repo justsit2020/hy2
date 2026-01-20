@@ -1,26 +1,25 @@
 FROM node:alpine
 
-# 安装基本工具
+# 安装必要工具
 RUN apk add --no-cache curl unzip
 
-# 设置工作目录
 WORKDIR /app
 
-# 复制项目文件
-COPY . .
+# 先复制 package.json，利用 Docker 缓存加速构建
+COPY package.json .
 
-# 安装 Node 依赖
+# [...](asc_slot://start-slot-7)安装依赖 (这步会安装 http-proxy)
 RUN npm install
 
-# (可选) 提前下载并安装 Xray/V2Ray 核心，避免每次启动都下载
-# 这里以 Xray 为例，逻辑通用
-RUN wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && \
-    unzip Xray-linux-64.zip && \
+# 下载 Xray 核心 (以 Linux 64位为例)
+RUN wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && \
+    unzip -q Xray-linux-64.zip && \
     mv xray /usr/bin/xray && \
-    rm -f Xray-linux-64.zip *.dat
+    chmod +x /usr/bin/xray && \
+    rm -f Xray-linux-64.zip *.dat *.json
 
-# 赋予执行权限
-RUN chmod +x /app/index.js
+# [...](asc_slot://start-slot-9)复制其余代码
+COPY . .
 
-# 设置启动命令
-CMD ["node", "index.js"]
+# 启动
+CMD ["npm", "start"]
