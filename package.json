@@ -1,10 +1,16 @@
 {
-  "name": "container-vmess",
+  "name": "vmess-container-serverless",
   "version": "1.0.0",
-  "description": "Serverless Vmess Container",
+  "description": "V2Ray/Xray on Serverless",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
 }
