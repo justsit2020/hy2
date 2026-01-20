@@ -1,416 +1,348 @@
-"use strict";
+'use strict';
 
-const fs = require("node:fs/promises");
-const fssync = require("node:fs");
-const path = require("node:path");
-const os = require("node:os");
-const crypto = require("node:crypto");
-const http = require("node:http");
-const { spawn } = require("node:child_process");
+const http = require('http');
+const https = require('https');
+const express = require('express');
+const { spawn } = require('child_process');
+const crypto = require('crypto');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const { Readable } = require('stream');
+const httpProxy = require('http-proxy');
+const AdmZip = require('adm-zip');
 
-const { Readable } = require("node:stream");
-const { pipeline } = require("node:stream/promises");
-
-const express = require("express");
-const httpProxy = require("http-proxy");
-const AdmZip = require("adm-zip");
-
-/**
- * =========================
- * 可配置项（环境变量）
- * =========================
- * PORT                 : HTTP 监听端口（平台一般自动注入）
- * UUID                 : VMess UUID（不填就随机生成，每次重启会变，建议必填）
- * WS_PATH              : WebSocket 路径，默认 /ws
- * PUBLIC_HOST          : 你的域名（不填则从请求 Host 推断）
- * PUBLIC_PORT          : 客户端连接端口，默认 443
- * NODE_NAME            : 节点名字，默认 vmess-ws
- * INFO_USER / INFO_PASS: /info 和 /sub 的 Basic Auth（强烈建议设置）
- * XRAY_LOCAL_PORT      : xray 本地端口，默认 10000
- * XRAY_ZIP_URL         : 指定 xray zip 下载地址（不填按架构自动选择）
- *
- * 访问：
- *   GET  /healthz  健康检查
- *   GET  /info     返回 JSON + vmess:// 链接
- *   GET  /sub      返回 base64 订阅（一行一个链接再 base64）
- *   WS   /ws       WS 入口（反代给本地 xray）
- */
-
-const DATA_DIR = process.env.DATA_DIR || path.join(os.tmpdir(), "vmess-ws");
-const BIN_DIR = path.join(DATA_DIR, "bin");
-const XRAY_DIR = path.join(BIN_DIR, "xray");
-const XRAY_ZIP = path.join(XRAY_DIR, "xray.zip");
-const XRAY_BIN = path.join(XRAY_DIR, "xray");
-const XRAY_CONFIG = path.join(DATA_DIR, "config.json");
-
-const HTTP_PORT = Number(process.env.PORT || 3000);
-const XRAY_LOCAL_PORT = Number(process.env.XRAY_LOCAL_PORT || 10000);
-
-const WS_PATH = normalizePath(process.env.WS_PATH || "/ws");
-
+const HTTP_PORT = Number(process.env.PORT || 3000);              // 平台一般注入 PORT
+const WS_PATH = (process.env.WS_PATH || '/ws').startsWith('/') ? (process.env.WS_PATH || '/ws') : `/${process.env.WS_PATH || 'ws'}`;
+const XRAY_LOCAL_PORT = Number(process.env.XRAY_LOCAL_PORT || 10000); // 仅容器内本地使用
 const UUID = process.env.UUID || crypto.randomUUID();
-const NODE_NAME = process.env.NODE_NAME || "vmess-ws";
 
-const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 443);
-const PUBLIC_HOST = (process.env.PUBLIC_HOST || "").trim();
+const INFO_USER = process.env.INFO_USER || '';
+const INFO_PASS = process.env.INFO_PASS || '';
 
-const INFO_USER = (process.env.INFO_USER || "").trim();
-const INFO_PASS = (process.env.INFO_PASS || "").trim();
+const BASE_DIR = process.env.BASE_DIR || '/tmp/vmess-ws';
+const BIN_DIR = path.join(BASE_DIR, 'bin');
+const XRAY_DIR = path.join(BIN_DIR, 'xray');
+const XRAY_BIN = path.join(XRAY_DIR, 'xray');
+const XRAY_CONFIG = path.join(BASE_DIR, 'config.json');
 
-const XRAY_ZIP_URL = (process.env.XRAY_ZIP_URL || defaultXrayZipUrl()).trim();
+const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
+const ENABLE_CLOUDFLARED = (process.env.ENABLE_CLOUDFLARED || '1') !== '0'; // 默认开启 Quick Tunnel
 
-let xrayProc = null;
-let xrayStatus = {
-  ok: false,
-  phase: "init",
-  error: "",
-  zipUrl: XRAY_ZIP_URL,
-  localPort: XRAY_LOCAL_PORT,
-  wsPath: WS_PATH
-};
-
-function normalizePath(p) {
-  if (!p.startsWith("/")) p = "/" + p;
-  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
-  return p;
-}
-
-async function ensureDir(dir) {
-  await fs.mkdir(dir, { recursive: true });
-}
-
-function basicAuthOK(req) {
-  if (!INFO_USER || !INFO_PASS) return true;
-  const h = req.headers["authorization"] || "";
-  if (!h.startsWith("Basic ")) return false;
-  const raw = Buffer.from(h.slice(6), "base64").toString("utf8");
-  const idx = raw.indexOf(":");
-  if (idx < 0) return false;
-  const u = raw.slice(0, idx);
-  const p = raw.slice(idx + 1);
-  return u === INFO_USER && p === INFO_PASS;
-}
-
-function requireAuth(req, res, next) {
-  if (basicAuthOK(req)) return next();
-  res.setHeader("WWW-Authenticate", 'Basic realm="info"');
-  res.status(401).send("Auth required");
-}
-
-function getPublicHost(req) {
-  const xfHost = (req.headers["x-forwarded-host"] || "")
-    .toString()
-    .split(",")[0]
-    .trim();
-
-  const host = PUBLIC_HOST || xfHost || (req.headers["host"] || "").toString();
-  return host.replace(/:\d+$/, "");
-}
-
-function buildVmessLink(host) {
-  const obj = {
-    v: "2",
-    ps: NODE_NAME,
-    add: host,
-    port: String(PUBLIC_PORT),
-    id: UUID,
-    aid: "0",
-    scy: "auto",
-    net: "ws",
-    type: "none",
-    host: host,
-    path: WS_PATH,
-    tls: "tls"
-  };
-  return "vmess://" + Buffer.from(JSON.stringify(obj), "utf8").toString("base64");
-}
-
-function buildSub(host) {
-  const raw = [buildVmessLink(host)].join("\n");
-  return Buffer.from(raw, "utf8").toString("base64");
-}
-
-/**
- * 关键修复点：
- * Node 20 的 fetch Response.body 是 Web ReadableStream（不是 Node Readable）
- * 所以不能 res.body.pipe(...)。
- * 这里优先用 Readable.fromWeb + pipeline；如果不可用则走 getReader 手动写文件。
- */
-async function writeWebStreamToFile(webStream, filepath) {
-  await ensureDir(path.dirname(filepath));
-
-  // 优先：Readable.fromWeb（Node 文档提供这个转换 API）:contentReference[oaicite:3]{index=3}
-  if (typeof Readable.fromWeb === "function") {
-    const nodeReadable = Readable.fromWeb(webStream);
-    const ws = fssync.createWriteStream(filepath);
-    await pipeline(nodeReadable, ws); // pipeline 是官方推荐的 Promise 写法 :contentReference[oaicite:4]{index=4}
-    return;
+// Xray 下载（你日志里就是这个 arm64 包；amd64 也给个常见名兜底）
+function defaultXrayZipUrl() {
+  if (process.platform !== 'linux') {
+    return 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip';
   }
+  if (process.arch === 'arm64') return 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip';
+  return 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip';
+}
+const XRAY_ZIP_URL = process.env.XRAY_ZIP_URL || defaultXrayZipUrl();
 
-  // 兜底：手动 reader
-  const ws = fssync.createWriteStream(filepath);
-  const reader = webStream.getReader();
+// cloudflared 下载：Cloudflare 官方 Downloads 页面给了 Linux 各架构下载入口:contentReference[oaicite:2]{index=2}
+function defaultCloudflaredUrl() {
+  if (process.platform !== 'linux') {
+    return 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared';
+  }
+  if (process.arch === 'arm64') return 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64';
+  return 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
+}
+const CLOUDFLARED_URL = process.env.CLOUDFLARED_URL || defaultCloudflaredUrl();
 
-  await new Promise((resolve, reject) => {
-    ws.on("error", reject);
+let publicUrl = '';   // https://xxxx.trycloudflare.com
+let publicHost = '';  // xxxx.trycloudflare.com
+let xrayProc = null;
+let cloudflaredProc = null;
+let xrayReady = false;
 
-    const pump = () => {
-      reader.read().then(({ done, value }) => {
-        if (done) {
-          ws.end();
-          resolve();
-          return;
+function log(...args) {
+  console.log(...args);
+}
+
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true });
+}
+
+function downloadToFile(url, outFile) {
+  return new Promise((resolve, reject) => {
+    const maxRedirects = 5;
+
+    function go(u, redirectsLeft) {
+      const req = https.get(u, (res) => {
+        // follow redirects (GitHub latest/download 常见 302)
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          if (redirectsLeft <= 0) return reject(new Error('Too many redirects'));
+          res.resume();
+          return go(res.headers.location, redirectsLeft - 1);
         }
-        const buf = Buffer.from(value);
-        if (!ws.write(buf)) {
-          ws.once("drain", pump);
-        } else {
-          pump();
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`Download failed: ${res.statusCode} ${res.statusMessage}`));
         }
-      }).catch(reject);
-    };
 
-    pump();
+        const file = fs.createWriteStream(outFile);
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+        file.on('error', reject);
+      });
+
+      req.on('error', reject);
+    }
+
+    go(url, maxRedirects);
   });
 }
 
-async function downloadToFile(url, filepath) {
-  const res = await fetch(url, { redirect: "follow" });
-
-  if (!res.ok) {
-    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  }
-
-  if (!res.body) {
-    // 极少数情况下 body 为空，兜底用 arrayBuffer
-    const ab = await res.arrayBuffer();
-    await ensureDir(path.dirname(filepath));
-    await fs.writeFile(filepath, Buffer.from(ab));
+async function ensureXray() {
+  if (fs.existsSync(XRAY_BIN)) {
+    log('[init] Xray exists:', XRAY_BIN);
     return;
   }
-
-  // 注意：Response.body 是 ReadableStream（MDN）:contentReference[oaicite:5]{index=5}
-  await writeWebStreamToFile(res.body, filepath);
-}
-
-function findFileRecursive(dir, filename) {
-  const entries = fssync.readdirSync(dir, { withFileTypes: true });
-  for (const e of entries) {
-    const full = path.join(dir, e.name);
-    if (e.isFile() && e.name === filename) return full;
-    if (e.isDirectory()) {
-      const r = findFileRecursive(full, filename);
-      if (r) return r;
-    }
-  }
-  return null;
-}
-
-async function ensureXray() {
   await ensureDir(XRAY_DIR);
+  const zipPath = path.join(BASE_DIR, 'xray.zip');
 
-  if (fssync.existsSync(XRAY_BIN)) return;
+  log('[init] Xray not found, downloading...');
+  log('[init] XRAY_ZIP_URL=' + XRAY_ZIP_URL);
+  await downloadToFile(XRAY_ZIP_URL, zipPath);
 
-  xrayStatus.phase = "download";
-  xrayStatus.zipUrl = XRAY_ZIP_URL;
-  console.log(`[init] Xray not found, downloading...`);
-  console.log(`[init] XRAY_ZIP_URL=${XRAY_ZIP_URL}`);
-
-  await downloadToFile(XRAY_ZIP_URL, XRAY_ZIP);
-
-  xrayStatus.phase = "unzip";
-  const zip = new AdmZip(XRAY_ZIP);
+  const zip = new AdmZip(zipPath);
   zip.extractAllTo(XRAY_DIR, true);
+  await fsp.chmod(XRAY_BIN, 0o755);
 
-  if (!fssync.existsSync(XRAY_BIN)) {
-    const found = findFileRecursive(XRAY_DIR, "xray");
-    if (!found) throw new Error("xray binary not found after unzip");
-    await fs.copyFile(found, XRAY_BIN);
-  }
-
-  await fs.chmod(XRAY_BIN, 0o755);
-  console.log(`[init] Xray ready: ${XRAY_BIN}`);
+  log('[init] Xray ready:', XRAY_BIN);
 }
 
 async function writeXrayConfig() {
   const cfg = {
-    log: { loglevel: "warning" },
+    log: { loglevel: 'warning' },
     inbounds: [
       {
-        listen: "127.0.0.1",
+        listen: '127.0.0.1',
         port: XRAY_LOCAL_PORT,
-        protocol: "vmess",
+        protocol: 'vmess',
         settings: {
           clients: [{ id: UUID, alterId: 0 }]
         },
         streamSettings: {
-          network: "ws",
+          network: 'ws',
           wsSettings: { path: WS_PATH }
         }
       }
     ],
-    outbounds: [{ protocol: "freedom" }]
+    outbounds: [{ protocol: 'freedom', settings: {} }]
   };
 
-  await ensureDir(path.dirname(XRAY_CONFIG));
-  await fs.writeFile(XRAY_CONFIG, JSON.stringify(cfg, null, 2), "utf8");
-  console.log(`[init] Wrote Xray config: ${XRAY_CONFIG}`);
+  await ensureDir(BASE_DIR);
+  await fsp.writeFile(XRAY_CONFIG, JSON.stringify(cfg, null, 2));
+  log('[init] Wrote Xray config:', XRAY_CONFIG);
 }
 
-function startXray() {
-  xrayStatus.phase = "run";
-  console.log(`[start] starting xray on 127.0.0.1:${XRAY_LOCAL_PORT} ws:${WS_PATH}`);
-
-  const p = spawn(XRAY_BIN, ["run", "-config", XRAY_CONFIG], {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  p.stdout.on("data", (d) => process.stdout.write(`[xray] ${d}`));
-  p.stderr.on("data", (d) => process.stderr.write(`[xray] ${d}`));
-
-  p.on("spawn", () => {
-    xrayStatus.ok = true;
-    xrayStatus.error = "";
-    console.log("[xray] spawned");
-  });
-
-  p.on("exit", (code, signal) => {
-    xrayStatus.ok = false;
-    xrayStatus.error = `xray exited code=${code} signal=${signal}`;
-    console.error(`[xray] exited code=${code} signal=${signal}`);
-    // 不强制退出：让 /info 仍可访问，方便你从域名看状态/拿配置
-  });
-
-  return p;
-}
-
-function defaultXrayZipUrl() {
-  // 从 GitHub Releases 下载预编译 ZIP（官方发布方式）:contentReference[oaicite:6]{index=6}
-  const arch = process.arch; // x64 / arm64
-  if (arch === "arm64") {
-    return "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip";
+async function waitPort(host, port, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await new Promise((resolve, reject) => {
+        const s = require('net').connect(port, host, () => {
+          s.destroy();
+          resolve();
+        });
+        s.on('error', reject);
+      });
+      return true;
+    } catch {
+      await new Promise(r => setTimeout(r, 200));
+    }
   }
-  return "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip";
+  return false;
 }
 
-async function bootXrayAsync() {
-  try {
-    xrayStatus.phase = "prepare";
-    await ensureDir(DATA_DIR);
-    await ensureDir(BIN_DIR);
+async function startXray() {
+  await ensureXray();
+  await writeXrayConfig();
 
-    await ensureXray();
-    await writeXrayConfig();
-    xrayProc = startXray();
-  } catch (e) {
-    xrayStatus.ok = false;
-    xrayStatus.phase = "error";
-    xrayStatus.error = String(e?.stack || e?.message || e);
-    console.error("[xray] boot failed:", xrayStatus.error);
+  log('[start] starting xray on 127.0.0.1:' + XRAY_LOCAL_PORT + ' ws:' + WS_PATH);
+
+  xrayProc = spawn(XRAY_BIN, ['run', '-c', XRAY_CONFIG], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  xrayProc.stdout.on('data', (d) => process.stdout.write('[xray] ' + d.toString()));
+  xrayProc.stderr.on('data', (d) => process.stderr.write('[xray] ' + d.toString()));
+
+  const ok = await waitPort('127.0.0.1', XRAY_LOCAL_PORT, 20000);
+  xrayReady = ok;
+  log(ok ? '[init] Xray port is ready' : '[warn] Xray port not ready yet');
+}
+
+async function ensureCloudflared() {
+  if (fs.existsSync(CLOUDFLARED_BIN)) {
+    return;
   }
+  await ensureDir(BIN_DIR);
+  log('[init] cloudflared not found, downloading...');
+  log('[init] CLOUDFLARED_URL=' + CLOUDFLARED_URL);
+  await downloadToFile(CLOUDFLARED_URL, CLOUDFLARED_BIN);
+  await fsp.chmod(CLOUDFLARED_BIN, 0o755);
+  log('[init] cloudflared ready:', CLOUDFLARED_BIN);
 }
 
-function createApp() {
-  const app = express();
+// 从 cloudflared 输出里抓 trycloudflare URL
+function extractTryUrl(line) {
+  const m = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+  return m ? m[0] : '';
+}
 
-  app.get("/healthz", (req, res) => res.status(200).send("ok"));
+async function startCloudflared() {
+  if (!ENABLE_CLOUDFLARED) return;
 
-  app.get("/", (req, res) => {
-    res.type("html").send(`
-      <h3>Service is running</h3>
-      <ul>
-        <li><a href="/status">/status</a> (xray status)</li>
-        <li><a href="/info">/info</a> (node info)</li>
-        <li><a href="/sub">/sub</a> (subscription)</li>
-      </ul>
-      <p>WS endpoint: <code>${WS_PATH}</code></p>
-    `);
+  await ensureCloudflared();
+
+  // Quick Tunnel 官方命令：cloudflared tunnel --url http://localhost:8080 :contentReference[oaicite:3]{index=3}
+  const target = `http://127.0.0.1:${HTTP_PORT}`;
+  log('[cf] starting quick tunnel to', target);
+
+  cloudflaredProc = spawn(CLOUDFLARED_BIN, ['tunnel', '--url', target], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env } // 注意：如果容器里有 .cloudflared/config.yaml，Quick Tunnel 会不工作:contentReference[oaicite:4]{index=4}
   });
 
-  app.get("/status", (req, res) => {
-    res.json({
-      ...xrayStatus,
-      node: { port: HTTP_PORT, arch: process.arch, platform: process.platform }
-    });
-  });
+  const onData = (prefix) => (buf) => {
+    const s = buf.toString();
+    process.stdout.write(prefix + s);
 
-  app.get("/info", requireAuth, (req, res) => {
-    const host = getPublicHost(req);
-    res.json({
-      name: NODE_NAME,
-      host,
-      publicPort: PUBLIC_PORT,
-      wsPath: WS_PATH,
-      uuid: UUID,
-      vmess: buildVmessLink(host),
-      note: INFO_USER && INFO_PASS ? "protected" : "public"
-    });
-  });
+    if (!publicUrl) {
+      const u = extractTryUrl(s);
+      if (u) {
+        publicUrl = u;
+        publicHost = u.replace('https://', '');
+        log('[cf] public url:', publicUrl);
+        log('[node] vmess link (cloudflared):');
+        log(buildVmessLink(publicHost));
+      }
+    }
+  };
 
-  app.get("/sub", requireAuth, (req, res) => {
-    const host = getPublicHost(req);
-    res.type("text/plain").send(buildSub(host));
-  });
+  cloudflaredProc.stdout.on('data', onData('[cloudflared] '));
+  cloudflaredProc.stderr.on('data', onData('[cloudflared] '));
+}
 
-  return app;
+function buildVmessLink(host) {
+  const obj = {
+    v: '2',
+    ps: 'vmess-ws-cf',
+    add: host || 'YOUR_TRYCLOUDFLARE_DOMAIN',
+    port: '443',
+    id: UUID,
+    aid: '0',
+    scy: 'auto',
+    net: 'ws',
+    type: 'none',
+    host: host || 'YOUR_TRYCLOUDFLARE_DOMAIN',
+    path: WS_PATH,
+    tls: 'tls'
+  };
+  const b64 = Buffer.from(JSON.stringify(obj)).toString('base64');
+  return 'vmess://' + b64;
+}
+
+function basicAuth(req) {
+  if (!INFO_USER || !INFO_PASS) return true;
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Basic ')) return false;
+  const raw = Buffer.from(h.slice(6), 'base64').toString();
+  const [u, p] = raw.split(':');
+  return u === INFO_USER && p === INFO_PASS;
 }
 
 async function main() {
-  // 先把 HTTP 服务起起来，避免“xray 下载失败 -> 整个域名不可用”
-  const app = createApp();
+  await ensureDir(BASE_DIR);
+  await ensureDir(BIN_DIR);
+
+  const app = express();
+
+  app.get('/kaithhealth', (_req, res) => res.status(200).send('ok'));
+
+  // 避免有人用浏览器直接 GET /ws 导致 Xray 看到“非 VMess 数据”
+  app.all(WS_PATH, (req, res) => {
+    // 只允许 WebSocket upgrade
+    if ((req.headers.upgrade || '').toLowerCase() !== 'websocket') {
+      return res.status(426).send('Upgrade Required');
+    }
+    return res.status(400).send('Bad Request');
+  });
+
+  app.get('/info', (req, res) => {
+    if (!basicAuth(req)) {
+      res.set('WWW-Authenticate', 'Basic realm="info"');
+      return res.status(401).send('Auth required');
+    }
+    res.json({
+      httpPort: HTTP_PORT,
+      wsPath: WS_PATH,
+      xrayLocalPort: XRAY_LOCAL_PORT,
+      uuid: UUID,
+      cloudflaredEnabled: ENABLE_CLOUDFLARED,
+      publicUrl,
+      vmess: publicHost ? buildVmessLink(publicHost) : '(waiting cloudflared url...)'
+    });
+  });
+
+  app.get('/sub', (req, res) => {
+    if (!basicAuth(req)) {
+      res.set('WWW-Authenticate', 'Basic realm="sub"');
+      return res.status(401).send('Auth required');
+    }
+    const link = publicHost ? buildVmessLink(publicHost) : '';
+    const body = Buffer.from(link ? (link + '\n') : '').toString('base64');
+    res.type('text/plain').send(body);
+  });
+
   const server = http.createServer(app);
 
-  // WS 反代到本地 xray
   const proxy = httpProxy.createProxyServer({
     target: `http://127.0.0.1:${XRAY_LOCAL_PORT}`,
     ws: true
   });
 
-  proxy.on("error", (err, req, res) => {
-    console.error("[proxy] error:", err?.message || err);
-    try {
-      if (res && !res.headersSent) res.writeHead(502);
-      res && res.end("Bad gateway");
-    } catch (_) {}
+  proxy.on('error', (err, _req, _res) => {
+    console.error('[proxy] error:', err && err.message ? err.message : err);
   });
 
-  server.on("upgrade", (req, socket, head) => {
-    if (!req.url || !req.url.startsWith(WS_PATH)) {
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url !== WS_PATH) {
+      socket.destroy();
+      return;
+    }
+    if (!xrayReady) {
+      // xray 没就绪，直接拒绝，避免 ECONNREFUSED + 平台反代报错
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
       return;
     }
     proxy.ws(req, socket, head);
   });
 
-  server.listen(HTTP_PORT, () => {
-    console.log(`[http] listening on :${HTTP_PORT}`);
-    console.log(`[http] ws path: ${WS_PATH}`);
-    if (INFO_USER && INFO_PASS) {
-      console.log(`[http] /info & /sub are protected by Basic Auth`);
-    } else {
-      console.warn(`[http] WARNING: /info & /sub are PUBLIC. Set INFO_USER/INFO_PASS to protect them.`);
+  server.listen(HTTP_PORT, '0.0.0.0', async () => {
+    log('[http] listening on :' + HTTP_PORT);
+    log('[http] ws path:', WS_PATH);
+
+    if (!INFO_USER || !INFO_PASS) {
+      log('[http] WARNING: /info & /sub are PUBLIC. Set INFO_USER/INFO_PASS to protect them.');
     }
 
-    const placeholderHost = PUBLIC_HOST || "YOUR_DOMAIN";
-    console.log(`[node] vmess link (placeholder):\n${buildVmessLink(placeholderHost)}\n`);
-    console.log(`[node] Tip: set PUBLIC_HOST to print a real link immediately.`);
+    // 先起 xray，再起 cloudflared，减少你之前看到的 ECONNREFUSED
+    await startXray();
+
+    // 你要用 cloudflared：它会在日志里打印 trycloudflare.com 链接:contentReference[oaicite:5]{index=5}
+    await startCloudflared();
+
+    // 兜底：如果你还想先看到一个“当前配置”的占位
+    log('[node] uuid:', UUID);
+    log('[node] waiting for cloudflared url... (check logs or /info)');
   });
-
-  // 后台启动 xray（失败也不影响 info 页可用）
-  bootXrayAsync();
-
-  // 优雅退出
-  const shutdown = () => {
-    try {
-      if (xrayProc) xrayProc.kill("SIGTERM");
-    } catch (_) {}
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
 }
 
 main().catch((e) => {
-  console.error("[fatal]", e);
+  console.error('[fatal]', e);
   process.exit(1);
 });
