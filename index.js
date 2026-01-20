@@ -9,23 +9,18 @@ const AdmZip = require('adm-zip');
 
 // --- 基础配置 ---
 const PORT = process.env.PORT || 3000;
-// 自动去除 UUID 空格
-const UUID = (process.env.UUID || uuidv4()).trim();
-// 自动处理路径
-let NESTED_PATH = (process.env.VMESS_PATH || '/vless').trim(); // 默认改为 /vless
-if (!NESTED_PATH.startsWith('/')) NESTED_PATH = '/' + NESTED_PATH;
+const UUID = (process.env.UUID || '0890b53a-5c1d-4b84-82f5-30b427493032').trim(); // 固定一个新 UUID
+
+// 定义两个路径
+const PATH_VMESS = '/vmess';
+const PATH_VLESS = '/vless';
 
 const TMP_DIR = '/tmp';
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
-const INTERNAL_PORT = 10000;
-
-// 两个架构下载地址
 const URL_X64 = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip';
 const URL_ARM = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-arm64-v8a.zip';
 
-console.log(`[Init] 启动准备... UUID: ${UUID}`);
-
-// --- 下载工具 ---
+// --- 下载与安装 ---
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const get = (link) => {
@@ -41,18 +36,10 @@ function downloadFile(url, dest) {
   });
 }
 
-// --- 架构安装 ---
 async function installAndTest(archName, url) {
   const binPath = path.join(TMP_DIR, 'xray');
   const zipPath = path.join(TMP_DIR, `xray-${archName}.zip`);
-  
-  if (fs.existsSync(binPath)) {
-    try {
-      execSync(`${binPath} -version`);
-      return true;
-    } catch(e) { fs.unlinkSync(binPath); }
-  }
-
+  if (fs.existsSync(binPath)) { try { execSync(`${binPath} -version`); return true; } catch(e) { fs.unlinkSync(binPath); } }
   try {
     await downloadFile(url, zipPath);
     const zip = new AdmZip(zipPath);
@@ -62,71 +49,75 @@ async function installAndTest(archName, url) {
     execSync(`${binPath} -version`);
     console.log(`[Success] 架构 ${archName} 可用`);
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
-// --- 主逻辑 ---
 async function start() {
   let success = await installAndTest('x64', URL_X64);
   if (!success) success = await installAndTest('arm64', URL_ARM);
+  if (!success) { console.error(`[Fatal] 核心失败`); process.exit(1); }
 
-  if (!success) {
-    console.error(`[Fatal] 核心启动失败`);
-    process.exit(1);
-  }
-
-  // --- 关键：使用 VLESS 协议 ---
+  // --- 配置文件：同时开启 VMess(10001) 和 VLESS(10002) ---
   const config = {
     "log": { "loglevel": "warning" },
-    "inbounds": [{
-      "port": INTERNAL_PORT,
-      "listen": "127.0.0.1",
-      "protocol": "vless", // 切换为 VLESS
-      "settings": { 
-        "clients": [{ "id": UUID }],
-        "decryption": "none"
+    "inbounds": [
+      {
+        "port": 10001,
+        "listen": "127.0.0.1",
+        "protocol": "vmess",
+        "settings": { "clients": [{ "id": UUID, "alterId": 0 }] },
+        "streamSettings": { "network": "ws", "wsSettings": { "path": PATH_VMESS } }
       },
-      "streamSettings": { 
-        "network": "ws", 
-        "wsSettings": { "path": NESTED_PATH } 
+      {
+        "port": 10002,
+        "listen": "127.0.0.1",
+        "protocol": "vless",
+        "settings": { "clients": [{ "id": UUID }], "decryption": "none" },
+        "streamSettings": { "network": "ws", "wsSettings": { "path": PATH_VLESS } }
       }
-    }],
+    ],
     "outbounds": [{ "protocol": "freedom", "settings": {} }]
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-  const xray = spawn(path.join(TMP_DIR, 'xray'), ['-c', CONFIG_FILE]);
+  // 禁用 AEAD 强制验证 (兼容旧版 VMess)
+  const env = Object.assign({}, process.env, { XRAY_VMESS_AEAD_FORCED: "false" });
+  const xray = spawn(path.join(TMP_DIR, 'xray'), ['-c', CONFIG_FILE], { env });
   xray.stdout.on('data', d => console.log(`[Xray] ${d}`));
   xray.stderr.on('data', d => console.error(`[Xray] ${d}`));
 
-  // --- Web 服务 ---
+  // --- Web 服务器 & 路由分发 ---
   const server = http.createServer((req, res) => {
     if (req.url === '/') {
       const host = req.headers.host;
-      // 生成 VLESS 链接
-      // 格式: vless://UUID@HOST:443?encryption=none&security=tls&type=ws&host=HOST&path=PATH#REMARK
-      const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-VLESS`;
+      // 生成 VMess 链接
+      const vmessInfo = { v:"2", ps:"Leapcell-VMess", add:host, port:"443", id:UUID, aid:"0", scy:"auto", net:"ws", type:"none", host:host, path:PATH_VMESS, tls:"tls" };
+      const vmessLink = 'vmess://' + Buffer.from(JSON.stringify(vmessInfo)).toString('base64');
       
+      // 生成 VLESS 链接
+      const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(PATH_VLESS)}#Leapcell-VLESS`;
+
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
-        <div style="font-family: sans-serif; padding: 20px;">
-          <h2 style="color: green;">✅ 服务已运行 (VLESS 模式)</h2>
-          <p>已切换为 VLESS 协议，连接更稳定。</p>
-          <hr>
-          <h3>📋 VLESS 链接 (复制导入):</h3>
-          <textarea style="width:100%; height:100px; font-family: monospace;">${vlessLink}</textarea>
-          <hr>
-          <h3>📝 手动配置信息:</h3>
+        <style>body{font-family:sans-serif;max-width:800px;margin:20px auto;padding:20px;} textarea{width:100%;height:80px;font-family:monospace;background:#f0f0f0;border:1px solid #ccc;} .box{border:1px solid #ddd;padding:15px;margin-bottom:20px;border-radius:5px;}</style>
+        <h1>🚀 节点配置中心</h1>
+        <p>UUID: <strong>${UUID}</strong></p>
+        
+        <div class="box">
+          <h3 style="color:#007bff">方案 A: VLESS 协议 (推荐, 更稳定)</h3>
+          <textarea>${vlessLink}</textarea>
           <ul>
-            <li><strong>协议 (Type):</strong> VLESS</li>
-            <li><strong>地址 (Address):</strong> ${host}</li>
-            <li><strong>端口 (Port):</strong> 443</li>
-            <li><strong>用户ID (UUID):</strong> ${UUID}</li>
-            <li><strong>传输协议 (Network):</strong> WebSocket (ws)</li>
-            <li><strong>路径 (Path):</strong> ${NESTED_PATH}</li>
-            <li><strong>TLS:</strong> 开启</li>
+             <li>路径 (Path): <code>${PATH_VLESS}</code></li>
+             <li>端口: 443 | 传输: ws | TLS: 开启</li>
+          </ul>
+        </div>
+
+        <div class="box">
+          <h3 style="color:#28a745">方案 B: VMess 协议 (兼容性好)</h3>
+          <textarea>${vmessLink}</textarea>
+          <ul>
+             <li>路径 (Path): <code>${PATH_VMESS}</code></li>
+             <li>AlterID: 0 | 端口: 443 | 传输: ws | TLS: 开启</li>
           </ul>
         </div>
       `);
@@ -136,11 +127,21 @@ async function start() {
     }
   });
 
-  // --- 原生 WebSocket 转发 (最稳的方式) ---
+  // --- WebSocket 路由转发 ---
   server.on('upgrade', (req, socket, head) => {
-    if (req.url.startsWith(NESTED_PATH)) {
-      const proxySocket = net.connect(INTERNAL_PORT, '127.0.0.1', () => {
-        proxySocket.write(`GET ${NESTED_PATH} HTTP/1.1\r\n` +
+    let targetPort = 0;
+    
+    // 根据路径分流到不同的 Xray 端口
+    if (req.url.startsWith(PATH_VMESS)) {
+      targetPort = 10001;
+    } else if (req.url.startsWith(PATH_VLESS)) {
+      targetPort = 10002;
+    }
+
+    if (targetPort > 0) {
+      const proxySocket = net.connect(targetPort, '127.0.0.1', () => {
+        // 重写 WebSocket 握手头
+        proxySocket.write(`GET ${req.url} HTTP/1.1\r\n` +
                           `Host: ${req.headers.host}\r\n` +
                           `Upgrade: websocket\r\n` +
                           `Connection: Upgrade\r\n` +
@@ -151,7 +152,6 @@ async function start() {
         socket.pipe(proxySocket);
         proxySocket.pipe(socket);
       });
-      
       proxySocket.on('error', () => socket.destroy());
       socket.on('error', () => proxySocket.destroy());
     } else {
@@ -160,7 +160,7 @@ async function start() {
   });
 
   server.listen(PORT, () => {
-    console.log(`[Server] 服务启动: 端口 ${PORT}`);
+    console.log(`[Server] 服务已启动: 端口 ${PORT}`);
   });
 }
 
