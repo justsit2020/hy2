@@ -7,21 +7,19 @@ const AdmZip = require('adm-zip');
 
 // --- 基础配置 ---
 const PORT = process.env.PORT || 3000;
-const UUID = (process.env.UUID || '4a03e390-8438-4e86-9a06-7e3e7f4c3912').trim();
-let NESTED_PATH = (process.env.VMESS_PATH || '/vless').trim();
+// 固定 UUID，防止变化
+const UUID = (process.env.UUID || '88888888-4444-4444-4444-123456789012').trim();
+let NESTED_PATH = (process.env.VMESS_PATH || '/vmess').trim();
 if (!NESTED_PATH.startsWith('/')) NESTED_PATH = '/' + NESTED_PATH;
 
 const TMP_DIR = '/tmp';
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
 
-// 直接锁定 ARM64 (既然之前日志验证了是 ARM)
+// 锁定 ARM64
 const URL_ARM = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-arm64-v8a.zip';
 
-console.log(`[Init] 启动直连模式... 架构: ARM64`);
-console.log(`[Init] 端口: ${PORT}`);
-console.log(`[Init] UUID: ${UUID}`);
+console.log(`[Init] 启动直连模式 (ARM64)...`);
 
-// --- 下载函数 ---
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const get = (link) => {
@@ -37,14 +35,13 @@ function downloadFile(url, dest) {
   });
 }
 
-// --- 主程序 ---
 async function start() {
   const binPath = path.join(TMP_DIR, 'xray');
   const zipPath = path.join(TMP_DIR, `xray.zip`);
 
   // 1. 下载安装
   try {
-    if (fs.existsSync(binPath)) fs.unlinkSync(binPath); // 强制重下，确保文件干净
+    if (fs.existsSync(binPath)) fs.unlinkSync(binPath);
     console.log(`[Download] 下载 Xray...`);
     await downloadFile(URL_ARM, zipPath);
     const zip = new AdmZip(zipPath);
@@ -61,12 +58,11 @@ async function start() {
   const config = {
     "log": { "loglevel": "warning" },
     "inbounds": [{
-      "port": parseInt(PORT), // 直接监听环境变量提供的端口
+      "port": parseInt(PORT), // 关键：直接监听系统分配端口
       "listen": "0.0.0.0",
-      "protocol": "vless",
+      "protocol": "vmess",
       "settings": { 
-        "clients": [{ "id": UUID }],
-        "decryption": "none"
+        "clients": [{ "id": UUID, "alterId": 0 }] 
       },
       "streamSettings": { 
         "network": "ws", 
@@ -77,24 +73,45 @@ async function start() {
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-  // 3. 生成并打印链接 (关键！)
-  // 由于没有网页了，必须把链接打印到日志里，用户自己复制
-  // 此时 host 只能用环境变量或者用户自己填
+  // 3. 打印连接信息 (这是你唯一获取链接的地方)
   const host = process.env.LEAPCELL_APP_URL ? process.env.LEAPCELL_APP_URL.replace('https://', '').replace('/', '') : "你的域名.leapcell.app";
   
-  const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-Direct`;
+  const vmessInfo = {
+    v: "2",
+    ps: "Leapcell-Direct",
+    add: host,
+    port: "443",
+    id: UUID,
+    aid: "0",
+    scy: "auto",
+    net: "ws",
+    type: "none",
+    host: host,
+    path: NESTED_PATH,
+    tls: "tls"
+  };
+  const link = 'vmess://' + Buffer.from(JSON.stringify(vmessInfo)).toString('base64');
 
   console.log(`\n=========================================================`);
-  console.log(`✅ 节点配置已生成 (请复制下方链接):`);
+  console.log(`✅ 节点链接 (复制下方内容):`);
   console.log(`---------------------------------------------------------`);
-  console.log(`${vlessLink}`);
+  console.log(`${link}`);
   console.log(`---------------------------------------------------------`);
-  console.log(`如果上方链接中的域名不正确，请手动将 '你的域名.leapcell.app' 替换为你真实的网址。`);
+  console.log(`如果上方链接无法使用，请检查客户端配置:`);
+  console.log(`地址: ${host}`);
+  console.log(`端口: 443`);
+  console.log(`UUID: ${UUID}`);
+  console.log(`传输: ws`);
+  console.log(`路径: ${NESTED_PATH}`);
+  console.log(`TLS:  开启 (必须开启!)`);
   console.log(`=========================================================\n`);
 
   // 4. 启动 Xray
-  console.log(`[Start] Xray 接管端口 ${PORT}...`);
-  const xray = spawn(binPath, ['-c', CONFIG_FILE], { stdio: 'inherit' });
+  // 关键：禁用 AEAD 强制验证，防止 unexpected EOF
+  const env = Object.assign({}, process.env, { XRAY_VMESS_AEAD_FORCED: "false" });
+  
+  console.log(`[Start] Xray 直接接管端口 ${PORT}...`);
+  const xray = spawn(binPath, ['-c', CONFIG_FILE], { env, stdio: 'inherit' });
   
   xray.on('close', (code) => {
     console.log(`Xray 退出: ${code}`);
