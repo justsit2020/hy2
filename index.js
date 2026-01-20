@@ -25,7 +25,7 @@ const WS_PATH_RAW = (process.env.WS_PATH || HARD_WS_PATH).trim() || '/vmess-argo
 const WS_PATH = WS_PATH_RAW.startsWith('/') ? WS_PATH_RAW : `/${WS_PATH_RAW}`;
 
 // 重要：下载到磁盘（/home/container），避免 /tmp(tmpfs) 导致 137
-const BASE_DIR = '/home/container';
+const BASE_DIR = './';
 const BIN_DIR = path.join(BASE_DIR, 'bin');
 const SB_PATH = path.join(BIN_DIR, 'web');
 const CF_PATH = path.join(BIN_DIR, 'bot');
@@ -272,4 +272,5 @@ async function main() {
 }
 
 main().catch(e => die(e && e.stack ? e.stack : String(e)));
+
 
