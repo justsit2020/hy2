@@ -1,30 +1,27 @@
 const fs = require('fs');
 const https = require('https');
 const { spawn, execSync } = require('child_process');
-const http = require('http');
-const net = require('net');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const AdmZip = require('adm-zip');
 
 // --- 基础配置 ---
 const PORT = process.env.PORT || 3000;
-// 自动去除 UUID 空格
-const UUID = (process.env.UUID || uuidv4()).trim();
-// 自动处理路径
+const UUID = (process.env.UUID || '4a03e390-8438-4e86-9a06-7e3e7f4c3912').trim();
 let NESTED_PATH = (process.env.VMESS_PATH || '/vless').trim();
 if (!NESTED_PATH.startsWith('/')) NESTED_PATH = '/' + NESTED_PATH;
 
 const TMP_DIR = '/tmp';
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
-const INTERNAL_PORT = 10000;
 
+// 直接锁定 ARM64 (既然之前日志验证了是 ARM)
 const URL_ARM = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-arm64-v8a.zip';
 
-console.log(`[Init] 启动准备... 架构: ARM64`);
+console.log(`[Init] 启动直连模式... 架构: ARM64`);
+console.log(`[Init] 端口: ${PORT}`);
 console.log(`[Init] UUID: ${UUID}`);
 
-// --- 下载工具 ---
+// --- 下载函数 ---
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const get = (link) => {
@@ -40,44 +37,32 @@ function downloadFile(url, dest) {
   });
 }
 
-// --- 安装核心 ---
-async function installCore() {
+// --- 主程序 ---
+async function start() {
   const binPath = path.join(TMP_DIR, 'xray');
   const zipPath = path.join(TMP_DIR, `xray.zip`);
-  
-  if (fs.existsSync(binPath)) {
-    try {
-      execSync(`${binPath} -version`);
-      console.log(`[Init] 核心校验通过`);
-      return true;
-    } catch(e) { fs.unlinkSync(binPath); }
-  }
 
+  // 1. 下载安装
   try {
+    if (fs.existsSync(binPath)) fs.unlinkSync(binPath); // 强制重下，确保文件干净
+    console.log(`[Download] 下载 Xray...`);
     await downloadFile(URL_ARM, zipPath);
     const zip = new AdmZip(zipPath);
     zip.extractAllTo(TMP_DIR, true);
     fs.chmodSync(binPath, 0o755);
     fs.unlinkSync(zipPath);
-    execSync(`${binPath} -version`);
-    console.log(`[Success] 安装成功`);
-    return true;
+    console.log(`[Success] 安装完毕`);
   } catch (e) {
-    console.error(`[Fatal] 安装失败`);
-    return false;
+    console.error(`[Fatal] 下载失败: ${e.message}`);
+    process.exit(1);
   }
-}
 
-// --- 主逻辑 ---
-async function start() {
-  if (!await installCore()) process.exit(1);
-
-  // --- VLESS 配置 ---
+  // 2. 生成配置 (Xray 直接监听 PORT)
   const config = {
     "log": { "loglevel": "warning" },
     "inbounds": [{
-      "port": INTERNAL_PORT,
-      "listen": "127.0.0.1",
+      "port": parseInt(PORT), // 直接监听环境变量提供的端口
+      "listen": "0.0.0.0",
       "protocol": "vless",
       "settings": { 
         "clients": [{ "id": UUID }],
@@ -92,71 +77,28 @@ async function start() {
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-  const xray = spawn(path.join(TMP_DIR, 'xray'), ['-c', CONFIG_FILE]);
-  xray.stdout.on('data', d => console.log(`[Xray] ${d}`));
-  xray.stderr.on('data', d => console.error(`[Xray] ${d}`));
+  // 3. 生成并打印链接 (关键！)
+  // 由于没有网页了，必须把链接打印到日志里，用户自己复制
+  // 此时 host 只能用环境变量或者用户自己填
+  const host = process.env.LEAPCELL_APP_URL ? process.env.LEAPCELL_APP_URL.replace('https://', '').replace('/', '') : "你的域名.leapcell.app";
+  
+  const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-Direct`;
 
-  // --- Web 服务 ---
-  const server = http.createServer((req, res) => {
-    if (req.url === '/') {
-      const host = req.headers.host;
-      const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(NESTED_PATH)}#Leapcell-Fixed`;
-      
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`
-        <h2>✅ 服务运行中 (透传模式)</h2>
-        <p>UUID: ${UUID}</p>
-        <textarea style="width:100%; height:100px;">${vlessLink}</textarea>
-      `);
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
+  console.log(`\n=========================================================`);
+  console.log(`✅ 节点配置已生成 (请复制下方链接):`);
+  console.log(`---------------------------------------------------------`);
+  console.log(`${vlessLink}`);
+  console.log(`---------------------------------------------------------`);
+  console.log(`如果上方链接中的域名不正确，请手动将 '你的域名.leapcell.app' 替换为你真实的网址。`);
+  console.log(`=========================================================\n`);
 
-  // --- 终极透传管道 ---
-  server.on('upgrade', (req, socket, head) => {
-    if (req.url.startsWith(NESTED_PATH)) {
-      
-      const proxySocket = net.connect(INTERNAL_PORT, '127.0.0.1', () => {
-        // 1. 构造请求行
-        let headers = `GET ${NESTED_PATH} HTTP/1.1\r\n`;
-        
-        // 2. 智能透传 Header
-        // 遍历所有 Header，除了 Host (我们自己重写) 和 压缩相关的 (防止兼容问题)
-        for (let key in req.headers) {
-          if (key.toLowerCase() !== 'host' && key.toLowerCase() !== 'sec-websocket-extensions') {
-            headers += `${key}: ${req.headers[key]}\r\n`;
-          }
-        }
-        
-        // 3. 补全必要 Header
-        headers += `Host: ${req.headers.host}\r\n`;
-        headers += `\r\n`; // 结束头
-
-        // 4. 发送握手
-        proxySocket.write(headers);
-        
-        // 5. 发送 Body (如有)
-        if (head && head.length > 0) proxySocket.write(head);
-        
-        // 6. 建立管道
-        socket.pipe(proxySocket);
-        proxySocket.pipe(socket);
-        
-        console.log(`[Proxy] 隧道建立成功`);
-      });
-
-      proxySocket.on('error', () => socket.destroy());
-      socket.on('error', () => proxySocket.destroy());
-
-    } else {
-      socket.destroy();
-    }
-  });
-
-  server.listen(PORT, () => {
-    console.log(`[Server] 服务启动: 端口 ${PORT}`);
+  // 4. 启动 Xray
+  console.log(`[Start] Xray 接管端口 ${PORT}...`);
+  const xray = spawn(binPath, ['-c', CONFIG_FILE], { stdio: 'inherit' });
+  
+  xray.on('close', (code) => {
+    console.log(`Xray 退出: ${code}`);
+    process.exit(code);
   });
 }
 
