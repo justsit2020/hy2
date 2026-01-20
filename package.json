@@ -1,7 +1,7 @@
 {
-  "name": "vmess-serverless-final-fix",
+  "name": "vmess-serverless-auto-arch",
   "version": "1.0.0",
-  "description": "Final Fix with Redirect Support",
+  "description": "Auto Detect Architecture",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
