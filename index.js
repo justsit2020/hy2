@@ -7,27 +7,34 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const AdmZip = require('adm-zip');
 
-// --- 基础配置 ---
+// --- 1. 强化环境变量处理 (自动去除空格/换行) ---
 const PORT = process.env.PORT || 3000;
-// 关键修改：如果没设置环境变量，强制使用这个固定 UUID，防止重启后失效
-const UUID = process.env.UUID || 'de04add9-5c68-8bab-950c-08cd5320df18'; 
-const NESTED_PATH = process.env.VMESS_PATH || '/vmess';
+// 优先读环境变量，如果没有则生成。关键：使用 .trim() 去除可能的空格
+const rawUUID = process.env.UUID || uuidv4();
+const UUID = rawUUID.trim(); 
+
+let rawPath = process.env.VMESS_PATH || '/vmess';
+rawPath = rawPath.trim();
+// 确保路径以 / 开头
+const NESTED_PATH = rawPath.startsWith('/') ? rawPath : '/' + rawPath;
+
 const TMP_DIR = '/tmp';
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
-
 const URL_X64 = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip';
 const URL_ARM = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-arm64-v8a.zip';
 
-console.log(`[Init] 启动中... UUID 已固定为: ${UUID}`);
+// --- 2. 打印关键调试信息 ---
+console.log(`=============================================`);
+console.log(`[Debug] 当前服务器时间: ${new Date().toString()}`);
+console.log(`[Debug] 使用 UUID: ${UUID}`);
+console.log(`[Debug] 使用 路径: ${NESTED_PATH}`);
+console.log(`=============================================`);
 
-// --- 下载辅助函数 ---
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const get = (link) => {
       https.get(link, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return get(res.headers.location);
-        }
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) return get(res.headers.location);
         if (res.statusCode !== 200) return reject(new Error(`Status ${res.statusCode}`));
         const file = fs.createWriteStream(dest);
         res.pipe(file);
@@ -38,81 +45,90 @@ function downloadFile(url, dest) {
   });
 }
 
-// --- 架构尝试函数 ---
 async function installAndTest(archName, url) {
   const zipPath = path.join(TMP_DIR, `xray-${archName}.zip`);
   const binPath = path.join(TMP_DIR, 'xray');
   
   if (fs.existsSync(binPath)) {
-    // 如果已经存在且能运行，直接复用，节省启动时间
     try {
       execSync(`${binPath} -version`);
-      console.log(`[Init] 复用已存在的 ${archName} 核心`);
       return true;
-    } catch(e) {
-      fs.unlinkSync(binPath); // 不能用就删了重下
-    }
+    } catch(e) { fs.unlinkSync(binPath); }
   }
 
   try {
-    console.log(`[Try] 下载架构: ${archName}`);
     await downloadFile(url, zipPath);
     const zip = new AdmZip(zipPath);
     zip.extractAllTo(TMP_DIR, true);
     fs.chmodSync(binPath, 0o755);
     fs.unlinkSync(zipPath);
     execSync(`${binPath} -version`);
-    console.log(`[Success] 架构 ${archName} 可用！`);
+    console.log(`[Success] 架构 ${archName} 就绪`);
     return true;
   } catch (e) {
-    console.log(`[Fail] 架构 ${archName} 失败，尝试下一个...`);
     return false;
   }
 }
 
-// --- 主程序 ---
 async function start() {
-  // 1. 安装核心
   let success = await installAndTest('x64', URL_X64);
   if (!success) success = await installAndTest('arm64', URL_ARM);
 
   if (!success) {
-    console.error(`[Fatal] 启动失败：无可用核心。`);
+    console.error(`[Fatal] 核心启动失败`);
     process.exit(1);
   }
 
-  // 2. 生成配置 (标准 VMess WebSocket)
+  // --- 3. 配置 Xray (开启 Debug 日志以便排查) ---
   const config = {
-    "log": { "loglevel": "warning" },
+    "log": { 
+      "loglevel": "debug", // 开启调试日志，看看到底哪里断了
+      "access": "",
+      "error": ""
+    },
     "inbounds": [{
       "port": 10000,
       "listen": "127.0.0.1",
       "protocol": "vmess",
       "settings": { 
-        "clients": [{ "id": UUID, "alterId": 0 }] 
+        "clients": [{ 
+          "id": UUID, 
+          "alterId": 0 
+        }] 
       },
       "streamSettings": { 
         "network": "ws", 
-        "wsSettings": { "path": NESTED_PATH } 
+        "wsSettings": { 
+          "path": NESTED_PATH 
+        } 
       }
     }],
     "outbounds": [{ "protocol": "freedom", "settings": {} }]
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-  // 3. 启动 Xray
   const xray = spawn(path.join(TMP_DIR, 'xray'), ['-c', CONFIG_FILE]);
+  // 实时输出 Xray 日志
   xray.stdout.on('data', d => console.log(`[Xray] ${d}`));
   xray.stderr.on('data', d => console.error(`[Xray] ${d}`));
 
-  // 4. Web 服务器 + 节点链接生成
-  const proxy = httpProxy.createProxyServer({});
+  const proxy = httpProxy.createProxyServer({
+    ws: true, // 明确开启 WebSocket 支持
+    xfwd: true // 转发 X-Forwarded-* 头
+  });
+
+  // 错误处理，防止代理挂掉
+  proxy.on('error', (err, req, res) => {
+    console.error(`[Proxy Error] ${err.message}`);
+    if (res && !res.headersSent) res.end();
+  });
+
   const server = http.createServer((req, res) => {
     if (req.url === '/') {
       const host = req.headers.host;
       const vmessInfo = {
         v: "2",
-        ps: "Leapcell-Fixed",
+        ps: `Leapcell-${UUID.substring(0,4)}`,
         add: host,
         port: "443",
         id: UUID,
@@ -128,15 +144,12 @@ async function start() {
       
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
-        <div style="font-family: sans-serif; padding: 20px;">
-          <h2>✅ 节点运行正常</h2>
-          <p><strong>UUID (已固定):</strong> ${UUID}</p>
-          <hr>
-          <h3>🚀 Vmess 链接 (全选复制):</h3>
-          <textarea style="width:100%; height:120px; font-size:12px;">${link}</textarea>
-          <hr>
-          <p style="color: #666; font-size: 14px;">提示：请确保客户端开启了 <strong>TLS</strong> (端口 443)</p>
-        </div>
+        <h3>Vmess Debug Mode</h3>
+        <p><strong>Server Time:</strong> ${new Date().toString()}</p>
+        <p><strong>UUID:</strong> ${UUID}</p>
+        <p><strong>Path:</strong> ${NESTED_PATH}</p>
+        <textarea style="width:100%; height:100px;">${link}</textarea>
+        <p>请检查客户端时间是否与服务器时间误差在 90秒 以内。</p>
       `);
     } else if (req.url.startsWith(NESTED_PATH)) {
       proxy.web(req, res, { target: 'http://127.0.0.1:10000' });
@@ -155,7 +168,7 @@ async function start() {
   });
 
   server.listen(PORT, () => {
-    console.log(`[Server] 服务已启动: https://${process.env.LEAPCELL_APP_URL || 'YOUR-URL'}`);
+    console.log(`[Server] 启动完成。端口: ${PORT}`);
   });
 }
 
